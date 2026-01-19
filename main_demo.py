@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 # pgmpy 库用于参数学习和推理
 from pgmpy.models import BayesianNetwork
@@ -22,7 +22,7 @@ except ImportError:
 
 
     # 这是一个 Mock 函数，仅用于演示流程，实际请确保库路径正确
-    def notears_nonlinear(X, lambda1, lambda2):
+    def notears_nonlinear(model, X, lambda1, lambda2):
         d = X.shape[1]
         # 返回一个随机但稀疏的矩阵，模拟学习到的结构
         return np.random.uniform(0, 0.5, (d, d)) * (np.random.rand(d, d) > 0.7)
@@ -31,54 +31,56 @@ except ImportError:
 # ==========================================
 # 1. 复杂场景数据构造 (Data Generation)
 # ==========================================
-def generate_battlefield_data(n=1000):
+def generate_battlefield_data(n=3000):
     """
     生成符合物理规律和战术逻辑的仿真数据 (修正版)
     """
     np.random.seed(42)
 
     # --- A. 强混杂因子 (Confounders) ---
-    # Weather: 0=好天气, 1=坏天气. Beta分布模拟"大部分时候天气尚可"
-    weather = np.random.beta(2, 5, n)
+    # 1. Weather (天气)
+    # 连续值用于物理计算 (0=极好, 1=极差)
+    weather_continuous = np.random.beta(2, 5, n)
+    # 离散值用于因果推断 (0:晴朗, 1:多云, 2:恶劣)
+    weather = np.digitize(weather_continuous, bins=[0.3, 0.6])
 
-    # Jamming: 电磁干扰
-    jamming = np.random.beta(1, 3, n)  # 0~1 之间，偏向低干扰但有高干扰尾部
+    # 2. Jamming (电磁干扰) - U型分布
+    jamming = np.random.beta(0.5, 0.5, n)
 
-    # Occlusion: 遮挡比例
-    occlusion = np.random.beta(1, 3, n)
+    # 3. Occlusion (遮挡) - 均匀分布
+    occlusion = np.random.uniform(0, 0.6, n)
 
     # --- B. 中间物理量 ---
-    # SNR: 确保信噪比范围合理 (0 ~ 30 dB)
-    # 逻辑: 天气差衰减大，干扰强衰减大
-    snr = 25 * np.exp(-2 * weather) - 15 * jamming + np.random.normal(0, 2, n)
+    # [关键修正] SNR: 确保逻辑是"天气越差SNR越低"
+    # 基础SNR 30dB, 随天气指数衰减, 随干扰线性减小
+    snr = 30 * np.exp(-2 * weather) - 15 * jamming
     snr = np.clip(snr, 0, 30)
 
-    # --- C. 干预变量 (Treatments - 识别算法表现) ---
+    # --- C. 干预变量 (Treatments) ---
     # Rec_Conf: 识别置信度
     base_conf = 0.5 + (snr / 60) - (occlusion * 0.4)
-    rec_conf = base_conf + np.random.normal(0, 0.05, n)
-    rec_conf = np.clip(rec_conf, 0.1, 0.99)
+    rec_conf = np.clip(base_conf, 0.1, 0.99)
 
-    # Rec_Latency: 识别耗时，干扰越大，算法处理越慢 (ms)
-    rec_latency = 30 + (jamming * 40) + np.random.normal(0, 5, n)
+    # Rec_Latency: 识别耗时 (ms)
+    rec_latency = 30 + (jamming * 40)
 
     # --- D. 中间状态变量 (Mediators) ---
-    # Track_Stable: 打击稳定性，受到识别准确性影响
-    track_stable = 0.8 * rec_conf + np.random.normal(0, 0.05, n)
+    # Track_Stable: 跟踪稳定性
+    track_stable = 0.8 * rec_conf
     track_stable = np.clip(track_stable, 0, 1)
 
     # Lock_Time: 锁定时间
-    # 逻辑: 延迟高、跟踪不稳 -> 锁定变慢
     lock_time = 2.0 + (rec_latency / 50) - (track_stable * 2.0)
     lock_time = np.clip(lock_time, 0.5, 10.0)
 
     # --- E. 结果变量 (Outcome) ---
     # Hit_Score: 命中得分
-    hit_score = 5 * track_stable - 0.5 * lock_time + np.random.normal(0, 0.5, n)
+    hit_score = 5 * track_stable - 0.5 * lock_time - 1.0 * weather
 
-    # 转换为概率 (Sigmoid)
-    hit_prob = 1 / (1 + np.exp(-(hit_score - 0.5)))  # 偏移一点确保正负样本平衡
-    hit_res = np.random.binomial(1, hit_prob)
+    # 转换为概率 (包含硬阈值截断)
+    raw_prob = 1 / (1 + np.exp(-hit_score))
+    final_prob = np.where(hit_score < 0, 0, raw_prob)
+    hit_res = np.random.binomial(1, final_prob)
 
     df = pd.DataFrame({
         'Weather': weather,
@@ -89,7 +91,7 @@ def generate_battlefield_data(n=1000):
         'Rec_Latency': rec_latency,
         'Track_Stable': track_stable,
         'Lock_Time': lock_time,
-        'Hit_Score': hit_score,
+        #'Hit_Score': hit_score,
         'Hit_Res': hit_res
     })
 
@@ -103,19 +105,26 @@ def learn_structure_with_constraints(df):
     print("\n[Step 2] 正在运行 NOTEARS-MLP 进行结构学习...")
 
     labels = df.columns.tolist()
-    # 强制转换为 float32，这是 PyTorch 默认接受的类型
-    X = df.values.astype(np.float32)
-    d = X.shape[1]  # 变量维度
+    X_raw = df.values.astype(np.float32)  # 原始数据
 
-    # --- [修复点] 实例化 MLP 模型 ---
+    # --- [关键修复] 数据标准化 ---
+    # 这步是防止 overflow 的关键！
+    # 将所有列转换到 均值=0, 方差=1 的分布
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_raw)
+
+    # 再次强制转为 float32 (StandardScaler 可能会转回 float64)
+    X = X_scaled.astype(np.float32)
+    print(X)
+
+    d = X.shape[1]
+
     # notears-mlp 需要先定义神经网络结构
     # dims = [输入维度, 隐藏层维度, 输出维度(通常为1)]
-    # 隐藏层设为 10 或 20 即可满足 Demo 需求
-    model = NotearsMLP(dims=[d, 10, 1], bias=True)
+    model = NotearsMLP(dims=[d, 32, 1], bias=True)
 
-    # --- [修复点] 调用函数时传入 model ---
-    # 注意参数顺序：(model, X, lambda1, lambda2)
-    adj_matrix = notears_nonlinear(model, X, lambda1=0.01, lambda2=0.01)
+    # 传入归一化后的 X
+    adj_matrix = notears_nonlinear(model, X, lambda1=0.001, lambda2=0.01)
 
     # 如果返回的是 torch.Tensor，转为 numpy
     if hasattr(adj_matrix, 'detach'):
@@ -126,7 +135,7 @@ def learn_structure_with_constraints(df):
 
     idx_map = {name: i for i, name in enumerate(labels)}
     constrained_matrix = adj_matrix.copy()
-    constrained_matrix[np.abs(constrained_matrix) < 0.1] = 0  # 阈值过滤
+    constrained_matrix[np.abs(constrained_matrix) < 0] = 0  # 阈值过滤
 
     print("  [约束] 正在应用物理黑名单剔除违禁边...")
     for src, dst in blacklist:
@@ -164,7 +173,7 @@ def generate_blacklist_auto(df_columns):
         # Tier 3: 状态/过程
         'Track_Stable': 3, 'Lock_Time': 3,
 
-        # Tier 4: 结果 (绝对下游)
+        # Tier 4: 结果
         'Hit_Res': 4
     }
 
@@ -190,7 +199,7 @@ def generate_blacklist_auto(df_columns):
 
             # 规则：禁止反向跨层流动
             # 如果源节点层级 > 目标节点层级，说明是反向边 (例如 结果->原因)，禁止！
-            if src_tier > dst_tier:
+            if src_tier >= dst_tier:
                 blacklist.append((src, dst))
 
             # 可选规则：禁止同一层级内乱指 (如果你希望层内独立)
@@ -252,7 +261,7 @@ def causal_inference_demo(G, df):
     # pgmpy 的推理在离散数据上最稳定。我们将连续变量分为 3 档 (Low/Med/High)
     df_disc = pd.DataFrame()
     for col in df.columns:
-        if col == 'Hit_Res':
+        if col == 'Hit_Res' | 'Weather':
             df_disc[col] = df[col]  # 已经是0/1，无需切分
         else:
             # qcut 按分位数切分，保证每箱样本均衡
@@ -275,11 +284,11 @@ def causal_inference_demo(G, df):
 
     # 场景 A: 算法表现不佳 (Confidence低, IoU低, Latency高)
     # 对应离散值: Conf=0, IoU=0, Latency=2 (注意Latency越大越差)
-    evidence_bad = {'Rec_Conf': 0, 'BBox_IoU': 0, 'Rec_Latency': 2}
+    evidence_bad = {'Rec_Conf': 0, 'Rec_Latency': 2}
 
     # 场景 B: 算法表现卓越 (Confidence高, IoU高, Latency低)
     # 对应离散值: Conf=2, IoU=2, Latency=0
-    evidence_good = {'Rec_Conf': 2, 'BBox_IoU': 2, 'Rec_Latency': 0}
+    evidence_good = {'Rec_Conf': 2, 'Rec_Latency': 0}
 
     try:
         # 计算 P(Hit_Res=1 | Evidence)
